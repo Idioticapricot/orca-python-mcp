@@ -1,74 +1,68 @@
-"""
-👋 Welcome to your Smithery project!
-To run your server, use "uv run dev"
-To test interactively, use "uv run playground"
-
-You might find this resources useful:
-
-🧑‍💻 MCP's Python SDK (helps you define your server)
-https://github.com/modelcontextprotocol/python-sdk
-"""
-
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
-
 from smithery.decorators import smithery
+from supabase import create_client, Client
+import httpx
+import hashlib
+import json
+from uuid import uuid4
 
+SUPABASE_URL = "https://zmbxocwnisqvkyqpqdkh.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptYnhvY3duaXNxdmt5cXBxZGtoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE1NjYyODMsImV4cCI6MjA3NzE0MjI4M30.bzc88z_WwX5XsN10jt1iDgFdKqLid1JIOxGxzsp4IR0"
 
-# Optional: If you want to receive session-level config from user, define it here
-class ConfigSchema(BaseModel):
-    # access_token: str = Field(..., description="Your access token for authentication")
-    pirate_mode: bool = Field(False, description="Speak like a pirate")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-# For servers with configuration:
-@smithery.server(config_schema=ConfigSchema)
-# For servers without configuration, simply use:
-# @smithery.server()
+@smithery.server()
 def create_server():
-    """Create and configure the MCP server."""
+    server = FastMCP("Orca Orchestrator")
 
-    # Create your FastMCP server as usual
-    server = FastMCP("Say Hello")
-
-    # Add a tool
     @server.tool()
-    def hello(name: str, ctx: Context) -> str:
-        """Say hello to someone."""
-        # Access session-specific config through context
-        session_config = ctx.session_config
+    def get_registry() -> str:
+        """Get the list of available agents from the registry."""
+        response = supabase.table("agents").select("*").execute()
+        return json.dumps(response.data, indent=2)
 
-        # In real apps, use token for API requests:
-        # requests.get(url, headers={"Authorization": f"Bearer {session_config.access_token}"})
-        # if not session_config.access_token:
-        #     return "Error: Access token required"
+    @server.tool()
+    def create_job(agent_id: str, caller_address: str, job_input: dict) -> str:
+        """Create a new job for an agent. Returns job_id."""
+        job_id = str(uuid4())
+        job_input_str = json.dumps(job_input, sort_keys=True)
+        job_input_hash = hashlib.sha256(job_input_str.encode()).hexdigest()
+        
+        job_data = {
+            "job_id": job_id,
+            "agent_id": agent_id,
+            "requester_addr": caller_address,
+            "job_input": job_input,
+            "job_input_hash": job_input_hash,
+            "state": "prepared"
+        }
+        
+        supabase.table("jobs").insert(job_data).execute()
+        return json.dumps({"job_id": job_id, "status": "created"})
 
-        # Create greeting based on pirate mode
-        if session_config.pirate_mode:
-            return f"Ahoy, {name}!"
-        else:
-            return f"Hello, {name}!"
-
-    # Add a resource
-    @server.resource("history://hello-world")
-    def hello_world() -> str:
-        """The origin story of the famous 'Hello, World' program."""
-        return (
-            '"Hello, World" first appeared in a 1972 Bell Labs memo by '
-            "Brian Kernighan and later became the iconic first program "
-            "for beginners in countless languages."
-        )
-
-    # Add a prompt
-    @server.prompt()
-    def greet(name: str) -> list:
-        """Generate a greeting prompt."""
-        return [
-            {
-                "role": "user",
-                "content": f"Say hello to {name}",
-            },
-        ]
+    @server.tool()
+    def prepare_job(job_id: str) -> str:
+        """Prepare a job by calling agent's /start_job/prepare endpoint. Returns unsigned transaction bundle."""
+        job_response = supabase.table("jobs").select("*, agents(subdomain)").eq("job_id", job_id).single().execute()
+        job = job_response.data
+        
+        agent_subdomain = job["agents"]["subdomain"]
+        agent_url = f"https://{agent_subdomain}.0rca.live/start_job/prepare"
+        
+        payload = {
+            "job_id": job_id,
+            "job_input": job["job_input"]
+        }
+        
+        with httpx.Client() as client:
+            response = client.post(agent_url, json=payload, timeout=30.0)
+            
+            if response.status_code == 402:
+                result = response.json()
+                supabase.table("jobs").update({"state": "payment_pending"}).eq("job_id", job_id).execute()
+                return json.dumps(result, indent=2)
+            else:
+                return json.dumps({"error": f"Unexpected status {response.status_code}", "body": response.text})
 
     return server
-
